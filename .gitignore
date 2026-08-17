@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+
+# agent-bridge runtime state (per-project session journals)
+# Uncomment to version-control handoffs alongside code:
+# .agent-context/
+
+# Local debug dumps
+.agent-bridge-debug/
