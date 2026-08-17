@@ -1,0 +1,926 @@
+#!/usr/bin/env python3
+"""
+agent-bridge — automatic, multi-session context bridge for Claude Code, Cursor, and Cline.
+
+Stdlib-only. Hook handlers must NEVER break the host CLI: any error -> silent exit 0.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+VERSION = "1.0.0"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+RULES_FILE = REPO_ROOT / "rules" / "agent-bridge.md"
+TEMPLATES_DIR = REPO_ROOT / "templates"
+
+GLOBAL_DIR = Path.home() / ".agent-bridge"
+ACTIVITY_LOG = GLOBAL_DIR / "activity.log"
+PPID_MAP = GLOBAL_DIR / "ppid-sessions.json"
+DEBUG_DIR = GLOBAL_DIR / "debug"
+
+CTX_DIRNAME = ".agent-context"
+INDEX_NAME = "index.json"
+MAX_LINE = 240
+MAX_LAST_SAID = 4000
+
+BLOCK_START = "<!-- agent-bridge:start -->"
+BLOCK_END = "<!-- agent-bridge:end -->"
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def now_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def debug_enabled() -> bool:
+    return bool(os.environ.get("AGENT_BRIDGE_DEBUG")) or (GLOBAL_DIR / "DEBUG").exists()
+
+
+def one_line(text, cap=MAX_LINE) -> str:
+    if text is None:
+        return ""
+    s = re.sub(r"\s+", " ", str(text)).strip()
+    return s if len(s) <= cap else s[: cap - 1] + "…"
+
+
+def load_json(path: Path, default):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return default
+
+
+def save_json_atomic(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+def human_age(iso_ts: str) -> str:
+    try:
+        then = datetime.fromisoformat(iso_ts).timestamp()
+    except Exception:
+        return "?"
+    delta = max(0, time.time() - then)
+    if delta < 60:
+        return f"{int(delta)}s ago"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    return f"{int(delta // 86400)}d ago"
+
+
+def git_branch(root: Path) -> str:
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        )
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def global_activity(line: str) -> None:
+    try:
+        GLOBAL_DIR.mkdir(parents=True, exist_ok=True)
+        with ACTIVITY_LOG.open("a") as f:
+            f.write(f"[{now_iso()}] {one_line(line, 400)}\n")
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# project / session model
+# ---------------------------------------------------------------------------
+
+def find_project_root(cwd: Path):
+    """Return (root, initialized). Initialized == .agent-context exists."""
+    p = cwd.resolve()
+    for d in [p, *p.parents]:
+        if (d / CTX_DIRNAME).is_dir():
+            return d, True
+    for d in [p, *p.parents]:
+        if (d / ".git").exists():
+            return d, False
+    return p, False
+
+
+def ctx_dir(root: Path) -> Path:
+    return root / CTX_DIRNAME
+
+
+def load_index(root: Path) -> dict:
+    idx = load_json(ctx_dir(root) / INDEX_NAME, None)
+    if not isinstance(idx, dict) or "sessions" not in idx:
+        idx = {"version": 1, "sessions": {}}
+    return idx
+
+
+def save_index(root: Path, idx: dict) -> None:
+    save_json_atomic(ctx_dir(root) / INDEX_NAME, idx)
+
+
+def sanitize_id(raw: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "", str(raw))[:48] or uuid.uuid4().hex[:8]
+
+
+def resolve_session_id(tool: str, payload: dict) -> str:
+    """Order: payload id fields -> env var -> stable per-parent-process id."""
+    for key in ("session_id", "conversation_id", "generation_id",
+                "sessionId", "conversationId", "chat_id", "chatId"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return sanitize_id(val)
+        if isinstance(val, int):
+            return sanitize_id(str(val))
+    env = os.environ.get("AGENT_BRIDGE_SESSION", "").strip()
+    if env:
+        return sanitize_id(env)
+    ppid = os.getppid()
+    key = f"{tool}:{ppid}"
+    mapping = load_json(PPID_MAP, {})
+    if key in mapping:
+        return mapping[key]
+    sid = uuid.uuid4().hex[:12]
+    mapping[key] = sid
+    save_json_atomic(PPID_MAP, mapping)
+    return sid
+
+
+def clear_ppid_session(tool: str) -> None:
+    key = f"{tool}:{os.getppid()}"
+    mapping = load_json(PPID_MAP, {})
+    if key in mapping:
+        mapping.pop(key, None)
+        save_json_atomic(PPID_MAP, mapping)
+
+
+def session_key(tool: str, sid: str) -> str:
+    return f"{tool}-{sid[:8]}"
+
+
+def render_template(name: str, mapping: dict) -> str:
+    try:
+        text = (TEMPLATES_DIR / name).read_text()
+    except Exception:
+        return ""
+    for k, v in mapping.items():
+        text = text.replace("{" + k + "}", str(v))
+    return text
+
+
+def ensure_session(root: Path, tool: str, sid: str, goal: str = ""):
+    """Create session dir + handoff.md if needed; register in index. Returns (key, dir)."""
+    key = session_key(tool, sid)
+    sdir = ctx_dir(root) / "sessions" / key
+    sdir.mkdir(parents=True, exist_ok=True)
+    meta_path = sdir / "meta.json"
+    if not meta_path.exists():
+        save_json_atomic(meta_path, {
+            "tool": tool, "session_ref": sid, "started": now_iso(),
+            "cwd": str(root), "branch": git_branch(root),
+        })
+    handoff = sdir / "handoff.md"
+    if not handoff.exists():
+        body = render_template("HANDOFF.template.md",
+                               {"tool": tool, "session": key, "date": now_iso()})
+        handoff.write_text(body or f"# Handoff — {key}\n")
+    journal = sdir / "journal.md"
+    if not journal.exists():
+        journal.write_text(f"# Journal — {key}\n\n")
+    idx = load_index(root)
+    entry = idx["sessions"].get(key, {})
+    entry.update({
+        "tool": tool,
+        "dir": f"sessions/{key}",
+        "started": entry.get("started") or now_iso(),
+        "last_active": now_iso(),
+        "status": "active",
+        "branch": git_branch(root) or entry.get("branch", ""),
+    })
+    if goal and not entry.get("goal"):
+        entry["goal"] = one_line(goal, 140)
+    idx["sessions"][key] = entry
+    save_index(root, idx)
+    return key, sdir
+
+
+def journal_append(sdir: Path, text: str) -> None:
+    try:
+        with (sdir / "journal.md").open("a") as f:
+            f.write(f"- [{now_iso()}] {one_line(text)}\n")
+    except Exception:
+        pass
+
+
+def touch_index(root: Path, key: str, **fields) -> None:
+    idx = load_index(root)
+    entry = idx["sessions"].get(key)
+    if entry is None:
+        return
+    entry["last_active"] = now_iso()
+    entry.update(fields)
+    save_index(root, idx)
+
+
+def find_session_dir(root: Path, key: str):
+    sdir = ctx_dir(root) / "sessions" / key
+    return sdir if sdir.is_dir() else None
+
+# ---------------------------------------------------------------------------
+# hook handlers
+# ---------------------------------------------------------------------------
+
+def claude_last_assistant_text(transcript_path: str) -> str:
+    """Extract the last assistant text message from a Claude Code transcript JSONL."""
+    if not transcript_path:
+        return ""
+    try:
+        lines = Path(transcript_path).read_text(errors="replace").splitlines()
+    except Exception:
+        return ""
+    for line in reversed(lines[-500:]):
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if obj.get("type") != "assistant":
+            continue
+        msg = obj.get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, list):
+            texts = [b.get("text", "") for b in content
+                     if isinstance(b, dict) and b.get("type") == "text"]
+            joined = "\n".join(t for t in texts if t).strip()
+            if joined:
+                return joined
+        elif isinstance(content, str) and content.strip():
+            return content.strip()
+    return ""
+
+
+def payload_text(payload: dict) -> str:
+    for key in ("text", "response", "message", "content", "output", "result"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def record_last_said(root: Path, key: str, sdir: Path, text: str) -> None:
+    if not text:
+        journal_append(sdir, "STOP: agent finished (no text captured)")
+        touch_index(root, key, last_line="agent stopped")
+        return
+    try:
+        (sdir / "last_said.md").write_text(text[:MAX_LAST_SAID])
+    except Exception:
+        pass
+    journal_append(sdir, f"LAST SAID: {text}")
+    touch_index(root, key, last_line=f"LAST SAID: {one_line(text, 120)}")
+
+
+def build_start_context(root: Path, tool: str, self_key: str) -> str:
+    """Context injected into the model at session start."""
+    idx = load_index(root)
+    others = []
+    for k, e in idx["sessions"].items():
+        if k == self_key or e.get("status") != "active":
+            continue
+        others.append((e.get("last_active", ""), k, e))
+    others.sort(reverse=True)
+    rel = f"{CTX_DIRNAME}/sessions/{self_key}"
+    lines = [
+        f"[agent-bridge] Session continuity is ACTIVE for this project. "
+        f"Your session dir: {rel}/ (journal.md is auto-captured by hooks).",
+        f"Maintain {rel}/handoff.md: after each milestone, make a SMALL edit updating "
+        f"'Current State' and 'Next Actions' (re-read the file first, keep it under ~40 lines). "
+        f"This is what lets another tool resume if you hit a usage limit.",
+    ]
+    if others:
+        lines.append("RESUMABLE SESSIONS from other/earlier tools:")
+        for _, k, e in others[:5]:
+            age = human_age(e.get("last_active", ""))
+            last = e.get("last_line") or e.get("goal") or "(no entries yet)"
+            lines.append(f"- {k} [{e.get('tool', '?')}, {age}]: {last}")
+        lines.append(
+            "If the user's prompt is a continuation of one of these, or they say 'resume': "
+            f"read {CTX_DIRNAME}/sessions/<key>/handoff.md (then journal.md tail if needed), "
+            "summarize your understanding in 2-3 sentences, and continue. "
+            "If the user is starting something new, ignore the old sessions.")
+    else:
+        lines.append("No prior sessions to resume. If the user says 'handoff', fully refresh "
+                     "your handoff.md (all sections). If they say 'resume', run "
+                     "`agent-bridge status` and report what exists.")
+    return "\n".join(lines)
+
+
+def emit_context(tool: str, event_name: str, text: str) -> None:
+    """Print context-injection JSON understood by Claude Code (and tolerated by Cursor)."""
+    out = {
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": text,
+        },
+        # alternates for other hook systems
+        "additionalContext": text,
+        "additional_context": text,
+    }
+    print(json.dumps(out))
+
+def run_hook(tool: str, event: str) -> int:
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    if debug_enabled():
+        try:
+            DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+            (DEBUG_DIR / f"{now_stamp()}-{tool}-{event}-{os.getpid()}.json").write_text(raw)
+        except Exception:
+            pass
+
+    cwd = Path(payload.get("cwd") or os.getcwd())
+    root, initialized = find_project_root(cwd)
+    if not initialized:
+        # Hooks are silent no-ops outside initialized projects.
+        if event == "session-start":
+            print("{}")
+        return 0
+
+    sid = resolve_session_id(tool, payload)
+    key, sdir = ensure_session(root, tool, sid)
+
+    if event == "session-start":
+        source = payload.get("source") or payload.get("reason") or ""
+        journal_append(sdir, f"SESSION START ({source})".rstrip())
+        global_activity(f"{root} {key} session-start")
+        emit_context(tool, "SessionStart", build_start_context(root, tool, key))
+        return 0
+
+    if event == "prompt":
+        text = payload.get("prompt") or payload.get("text") or payload_text(payload)
+        journal_append(sdir, f"PROMPT: {text}")
+        idx = load_index(root)
+        entry = idx["sessions"].get(key, {})
+        fields = {"last_line": f"PROMPT: {one_line(text, 120)}"}
+        if text and not entry.get("goal"):
+            fields["goal"] = one_line(text, 140)
+        touch_index(root, key, **fields)
+        return 0
+
+    if event == "tool":  # PostToolUse / postToolUse
+        name = payload.get("tool_name") or payload.get("toolName") or "?"
+        tin = payload.get("tool_input") or payload.get("toolInput") or {}
+        if not isinstance(tin, dict):
+            tin = {}
+        if name in ("Edit", "Write", "MultiEdit", "NotebookEdit", "edit", "write"):
+            target = tin.get("file_path") or tin.get("path") or payload.get("file_path") or "?"
+            journal_append(sdir, f"EDIT: {target}")
+            touch_index(root, key, last_line=f"EDIT: {one_line(target, 100)}")
+        elif name in ("Bash", "Shell", "shell", "run_command"):
+            cmd = tin.get("command") or payload.get("command") or "?"
+            resp = payload.get("tool_response") or {}
+            code = resp.get("exit_code") if isinstance(resp, dict) else None
+            suffix = f" (exit {code})" if code is not None else ""
+            journal_append(sdir, f"CMD: {cmd}{suffix}")
+            touch_index(root, key, last_line=f"CMD: {one_line(cmd, 100)}")
+        else:
+            brief = tin.get("file_path") or tin.get("command") or ""
+            journal_append(sdir, f"TOOL: {name} {brief}".rstrip())
+            touch_index(root, key, last_line=f"TOOL: {name}")
+        return 0
+
+    if event == "edit":  # Cursor afterFileEdit
+        path = payload.get("file_path") or payload.get("filePath") or "?"
+        journal_append(sdir, f"EDIT: {path}")
+        touch_index(root, key, last_line=f"EDIT: {one_line(path, 100)}")
+        return 0
+
+    if event == "shell":  # Cursor afterShellExecution
+        cmd = payload.get("command") or "?"
+        dur = payload.get("duration")
+        suffix = f" ({int(dur)}ms)" if isinstance(dur, (int, float)) else ""
+        journal_append(sdir, f"CMD: {cmd}{suffix}")
+        touch_index(root, key, last_line=f"CMD: {one_line(cmd, 100)}")
+        return 0
+
+    if event == "response":  # Cursor afterAgentResponse
+        text = payload_text(payload)
+        if text:
+            record_last_said(root, key, sdir, text)
+        return 0
+
+    if event == "stop":
+        text = ""
+        if tool == "claude":
+            text = claude_last_assistant_text(payload.get("transcript_path", ""))
+        if not text:
+            text = payload_text(payload)
+        record_last_said(root, key, sdir, text)
+        return 0
+
+    if event == "compact":
+        trigger = payload.get("trigger") or ""
+        journal_append(sdir, f"COMPACT: context window compacted {trigger}".rstrip())
+        touch_index(root, key, last_line="context compacted")
+        return 0
+
+    if event == "session-end":
+        reason = payload.get("reason") or payload.get("cause") or ""
+        journal_append(sdir, f"SESSION END ({reason})".rstrip())
+        touch_index(root, key, status="ended", last_line=f"session ended {reason}".strip())
+        global_activity(f"{root} {key} session-end")
+        clear_ppid_session(tool)
+        return 0
+
+    journal_append(sdir, f"EVENT {event}: {one_line(json.dumps(payload)[:200])}")
+    return 0
+
+# ---------------------------------------------------------------------------
+# install / uninstall
+# ---------------------------------------------------------------------------
+
+LOCAL_BIN = Path.home() / ".local" / "bin"
+CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
+CLAUDE_MD = Path.home() / ".claude" / "CLAUDE.md"
+CURSOR_HOOKS = Path.home() / ".cursor" / "hooks.json"
+CURSOR_RULES_DIR = Path.home() / ".cursor" / "rules"
+CLINE_RULES_DIR = Path.home() / "Documents" / "Cline" / "Rules"
+
+CLAUDE_HOOK_EVENTS = [
+    ("SessionStart", None, "session-start"),
+    ("UserPromptSubmit", None, "prompt"),
+    ("PostToolUse", "Edit|Write|MultiEdit|NotebookEdit|Bash", "tool"),
+    ("Stop", None, "stop"),
+    ("PreCompact", None, "compact"),
+    ("SessionEnd", None, "session-end"),
+]
+
+CURSOR_HOOK_EVENTS = [
+    ("sessionStart", "session-start"),
+    ("beforeSubmitPrompt", "prompt"),
+    ("postToolUse", "tool"),
+    ("afterFileEdit", "edit"),
+    ("afterShellExecution", "shell"),
+    ("afterAgentResponse", "response"),
+    ("stop", "stop"),
+    ("preCompact", "compact"),
+    ("sessionEnd", "session-end"),
+]
+
+
+def bridge_cmd(tool: str, event: str) -> str:
+    return f"{LOCAL_BIN / 'agent-bridge'} hook {tool} {event}"
+
+
+def read_rule_text() -> str:
+    try:
+        return RULES_FILE.read_text().strip() + "\n"
+    except Exception:
+        return "# agent-bridge\nSee README — rules file missing from repo.\n"
+
+
+def merge_claude_settings() -> str:
+    CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    data = load_json(CLAUDE_SETTINGS, {})
+    if not isinstance(data, dict):
+        data = {}
+    bak = CLAUDE_SETTINGS.with_suffix(".json.agent-bridge.bak")
+    if CLAUDE_SETTINGS.exists() and not bak.exists():
+        shutil.copy2(CLAUDE_SETTINGS, bak)
+    hooks = data.setdefault("hooks", {})
+    added = []
+    for event, matcher, sub in CLAUDE_HOOK_EVENTS:
+        lst = hooks.setdefault(event, [])
+        already = any("agent-bridge" in json.dumps(entry) for entry in lst)
+        if already:
+            continue
+        entry = {"hooks": [{"type": "command", "command": bridge_cmd("claude", sub)}]}
+        if matcher:
+            entry["matcher"] = matcher
+        lst.append(entry)
+        added.append(event)
+    save_json_atomic(CLAUDE_SETTINGS, data)
+    return f"{len(added)} hook events added" if added else "already present"
+
+
+def merge_cursor_hooks() -> str:
+    CURSOR_HOOKS.parent.mkdir(parents=True, exist_ok=True)
+    data = load_json(CURSOR_HOOKS, None)
+    if not isinstance(data, dict):
+        data = {"version": 1, "hooks": {}}
+    data.setdefault("version", 1)
+    bak = CURSOR_HOOKS.with_suffix(".json.agent-bridge.bak")
+    if CURSOR_HOOKS.exists() and not bak.exists():
+        shutil.copy2(CURSOR_HOOKS, bak)
+    hooks = data.setdefault("hooks", {})
+    added = []
+    for event, sub in CURSOR_HOOK_EVENTS:
+        lst = hooks.setdefault(event, [])
+        if any("agent-bridge" in json.dumps(entry) for entry in lst):
+            continue
+        lst.append({"command": bridge_cmd("cursor", sub)})
+        added.append(event)
+    save_json_atomic(CURSOR_HOOKS, data)
+    return f"{len(added)} hook events added" if added else "already present"
+
+
+def write_managed_block(path: Path, body: str) -> str:
+    block = f"{BLOCK_START}\n{body.rstrip()}\n{BLOCK_END}"
+    existing = path.read_text() if path.exists() else ""
+    if BLOCK_START in existing and BLOCK_END in existing:
+        pre = existing.split(BLOCK_START)[0]
+        post = existing.split(BLOCK_END, 1)[1]
+        new = pre + block + post
+        status = "updated"
+    else:
+        sep = "\n\n" if existing.strip() else ""
+        new = existing.rstrip() + sep + block + "\n"
+        status = "created"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new)
+    return status
+
+
+def install_cursor_rule() -> str:
+    CURSOR_RULES_DIR.mkdir(parents=True, exist_ok=True)
+    mdc = ("---\ndescription: agent-bridge cross-tool session continuity\n"
+           "alwaysApply: true\n---\n\n") + read_rule_text()
+    (CURSOR_RULES_DIR / "agent-bridge.mdc").write_text(mdc)
+    return str(CURSOR_RULES_DIR / "agent-bridge.mdc")
+
+
+def install_cline_rule() -> str:
+    CLINE_RULES_DIR.mkdir(parents=True, exist_ok=True)
+    link = CLINE_RULES_DIR / "agent-bridge.md"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(RULES_FILE)
+    return str(link)
+
+def cmd_install(args) -> int:
+    LOCAL_BIN.mkdir(parents=True, exist_ok=True)
+    src = REPO_ROOT / "bin" / "agent-bridge"
+    src.chmod(0o755)
+    link = LOCAL_BIN / "agent-bridge"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(src)
+
+    results = [
+        ("CLI symlink", f"{link} -> {src}"),
+        ("Claude Code hooks", merge_claude_settings()),
+        ("Claude Code CLAUDE.md", write_managed_block(CLAUDE_MD, read_rule_text())),
+        ("Cursor hooks", merge_cursor_hooks()),
+        ("Cursor global rule", install_cursor_rule()),
+        ("Cline global rule", install_cline_rule()),
+    ]
+    print("agent-bridge installed:\n")
+    for name, detail in results:
+        print(f"  ✓ {name}: {detail}")
+    print("\nNext: cd into a project and run `agent-bridge init` to enable capture there.")
+    print("Verify any time with `agent-bridge doctor`.")
+    return 0
+
+
+def remove_our_hook_entries(data: dict, list_key: str) -> int:
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return 0
+    removed = 0
+    for event in list(hooks.keys()):
+        lst = hooks[event]
+        if not isinstance(lst, list):
+            continue
+        kept = [e for e in lst if "agent-bridge" not in json.dumps(e)]
+        removed += len(lst) - len(kept)
+        if kept:
+            hooks[event] = kept
+        else:
+            del hooks[event]
+    if not hooks:
+        data.pop("hooks", None)
+    return removed
+
+
+def cmd_uninstall(args) -> int:
+    print("agent-bridge uninstall:\n")
+    link = LOCAL_BIN / "agent-bridge"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+        print(f"  ✓ removed {link}")
+
+    data = load_json(CLAUDE_SETTINGS, None)
+    if isinstance(data, dict):
+        n = remove_our_hook_entries(data, "hooks")
+        save_json_atomic(CLAUDE_SETTINGS, data)
+        print(f"  ✓ Claude Code hooks removed ({n})")
+
+    data = load_json(CURSOR_HOOKS, None)
+    if isinstance(data, dict):
+        n = remove_our_hook_entries(data, "hooks")
+        save_json_atomic(CURSOR_HOOKS, data)
+        print(f"  ✓ Cursor hooks removed ({n})")
+
+    if CLAUDE_MD.exists():
+        text = CLAUDE_MD.read_text()
+        if BLOCK_START in text and BLOCK_END in text:
+            pre = text.split(BLOCK_START)[0]
+            post = text.split(BLOCK_END, 1)[1]
+            CLAUDE_MD.write_text(pre.rstrip() + post)
+            print("  ✓ CLAUDE.md managed block removed")
+
+    for path in (CURSOR_RULES_DIR / "agent-bridge.mdc",
+                 CLINE_RULES_DIR / "agent-bridge.md"):
+        if path.is_symlink() or path.exists():
+            path.unlink()
+            print(f"  ✓ removed {path}")
+
+    print("\nData in ~/.agent-bridge and project .agent-context/ dirs were left untouched.")
+    return 0
+
+
+def cmd_init(args) -> int:
+    target = Path(args.path or ".").resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    ctx = ctx_dir(target)
+    (ctx / "sessions").mkdir(parents=True, exist_ok=True)
+    (ctx / "log").mkdir(parents=True, exist_ok=True)
+    if not (ctx / INDEX_NAME).exists():
+        save_json_atomic(ctx / INDEX_NAME, {"version": 1, "sessions": {}})
+
+    agents = target / "AGENTS.md"
+    if not agents.exists():
+        body = render_template("AGENTS.template.md", {"project": target.name})
+        agents.write_text(body or f"# {target.name}\n")
+        agents_status = "created"
+    else:
+        agents_status = "exists, untouched"
+
+    claude_md = target / "CLAUDE.md"
+    if claude_md.exists() or claude_md.is_symlink():
+        claude_status = "exists, untouched"
+    else:
+        claude_md.symlink_to("AGENTS.md")
+        claude_status = "symlink -> AGENTS.md"
+
+    print(f"Initialized agent-bridge in {target}:\n")
+    print(f"  ✓ {CTX_DIRNAME}/ (sessions/, log/, index.json)")
+    print(f"  ✓ AGENTS.md: {agents_status}")
+    print(f"  ✓ CLAUDE.md: {claude_status}")
+    print("\nEvery Claude Code / Cursor session here now auto-journals. "
+          "Cline joins via its global rule.")
+    return 0
+
+def cmd_status(args) -> int:
+    cwd = Path.cwd()
+    root, initialized = find_project_root(cwd)
+    if not initialized:
+        print(f"No {CTX_DIRNAME}/ found above {cwd}. Run `agent-bridge init` first.")
+        return 1
+    idx = load_index(root)
+    sessions = sorted(idx["sessions"].items(),
+                      key=lambda kv: kv[1].get("last_active", ""), reverse=True)
+    if args.json:
+        print(json.dumps({"project": str(root), "sessions": idx["sessions"]}, indent=2))
+        return 0
+    print(f"PROJECT  {root}\n")
+    if not sessions:
+        print("  no sessions recorded yet")
+    else:
+        print(f"  {'SESSION':<22} {'TOOL':<8} {'STATUS':<9} {'ACTIVE':<9} {'BRANCH':<18} LAST")
+        for key, e in sessions:
+            age = human_age(e.get("last_active", ""))
+            last = one_line(e.get("last_line") or e.get("goal") or "", 60)
+            print(f"  {key:<22} {e.get('tool','?'):<8} {e.get('status','?'):<9} "
+                  f"{age:<9} {one_line(e.get('branch',''),16):<18} {last}")
+    if args.all:
+        print("\nGLOBAL ACTIVITY (last 15):")
+        try:
+            lines = ACTIVITY_LOG.read_text().splitlines()[-15:]
+            for ln in lines:
+                print(f"  {ln}")
+        except Exception:
+            print("  (none)")
+    return 0
+
+
+def cmd_register(args) -> int:
+    """Used by tools without hooks (Cline) and for manual session creation."""
+    cwd = Path.cwd()
+    root, initialized = find_project_root(cwd)
+    if not initialized:
+        root = cwd.resolve()
+        (ctx_dir(root) / "sessions").mkdir(parents=True, exist_ok=True)
+        (ctx_dir(root) / "log").mkdir(parents=True, exist_ok=True)
+        save_index(root, load_index(root))
+    goal = " ".join(args.goal or [])
+    sid = os.environ.get("AGENT_BRIDGE_SESSION", "").strip() or uuid.uuid4().hex[:12]
+    key, sdir = ensure_session(root, args.tool, sanitize_id(sid), goal=goal)
+    journal_append(sdir, f"REGISTERED via CLI. Goal: {goal or '(none given)'}")
+    global_activity(f"{root} {key} registered")
+    if args.json:
+        print(json.dumps({"session": key, "dir": str(sdir), "project": str(root)}))
+    else:
+        print(f"SESSION={key}")
+        print(f"DIR={sdir}")
+        print(f"Next: keep {CTX_DIRNAME}/sessions/{key}/handoff.md updated at milestones;")
+        print(f"append journal lines with: agent-bridge note --session {key} \"<what happened>\"")
+    return 0
+
+
+def cmd_note(args) -> int:
+    text = " ".join(args.text or []).strip()
+    if not text:
+        print("usage: agent-bridge note [--session KEY] <text>", file=sys.stderr)
+        return 2
+    root, initialized = find_project_root(Path.cwd())
+    if not initialized:
+        print(f"No {CTX_DIRNAME}/ found; nothing to note into.", file=sys.stderr)
+        return 1
+    key = args.session
+    if not key:
+        idx = load_index(root)
+        actives = sorted(
+            ((e.get("last_active", ""), k) for k, e in idx["sessions"].items()
+             if e.get("status") == "active"),
+            reverse=True)
+        if not actives:
+            print("No active session. Run `agent-bridge register <tool>` first.",
+                  file=sys.stderr)
+            return 1
+        key = actives[0][1]
+    sdir = find_session_dir(root, key)
+    if not sdir:
+        print(f"Unknown session '{key}'.", file=sys.stderr)
+        return 1
+    journal_append(sdir, f"NOTE: {text}")
+    touch_index(root, key, last_line=f"NOTE: {one_line(text, 120)}")
+    print(f"noted -> {key}")
+    return 0
+
+def cmd_archive(args) -> int:
+    root, initialized = find_project_root(Path.cwd())
+    if not initialized:
+        print(f"No {CTX_DIRNAME}/ found.", file=sys.stderr)
+        return 1
+    idx = load_index(root)
+    targets = []
+    if args.all_ended:
+        targets = [k for k, e in idx["sessions"].items() if e.get("status") == "ended"]
+    elif args.session:
+        if args.session not in idx["sessions"]:
+            print(f"Unknown session '{args.session}'.", file=sys.stderr)
+            return 1
+        targets = [args.session]
+    else:
+        actives = sorted(
+            ((e.get("last_active", ""), k) for k, e in idx["sessions"].items()
+             if e.get("status") == "active"),
+            reverse=True)
+        if not actives:
+            print("No active session to archive. Use --all-ended for ended ones.")
+            return 1
+        targets = [actives[0][1]]
+
+    logdir = ctx_dir(root) / "log"
+    for key in targets:
+        sdir = find_session_dir(root, key)
+        if sdir:
+            dest = logdir / f"{now_stamp()}-{key}"
+            shutil.move(str(sdir), str(dest))
+            print(f"  ✓ archived {key} -> {CTX_DIRNAME}/log/{dest.name}")
+        idx["sessions"].pop(key, None)
+    save_index(root, idx)
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    ok = True
+
+    def check(label, good, hint=""):
+        nonlocal ok
+        mark = "✓" if good else "✗"
+        if not good:
+            ok = False
+        suffix = f"  ({hint})" if hint and not good else ""
+        print(f"  {mark} {label}{suffix}")
+
+    link = LOCAL_BIN / "agent-bridge"
+    check("CLI on ~/.local/bin", link.exists() or link.is_symlink(),
+          "run: agent-bridge install")
+    which = shutil.which("agent-bridge")
+    check("agent-bridge on PATH", bool(which), "add ~/.local/bin to PATH")
+
+    data = load_json(CLAUDE_SETTINGS, {})
+    claude_hooks = json.dumps(data.get("hooks", {}))
+    check("Claude Code hooks wired", "agent-bridge" in claude_hooks,
+          "run: agent-bridge install")
+
+    md = CLAUDE_MD.read_text() if CLAUDE_MD.exists() else ""
+    check("Claude Code CLAUDE.md block", BLOCK_START in md, "run: agent-bridge install")
+
+    cur = load_json(CURSOR_HOOKS, {})
+    check("Cursor hooks.json wired", "agent-bridge" in json.dumps(cur.get("hooks", {})),
+          "run: agent-bridge install")
+    check("Cursor global rule", (CURSOR_RULES_DIR / "agent-bridge.mdc").exists(),
+          "run: agent-bridge install")
+
+    cline = CLINE_RULES_DIR / "agent-bridge.md"
+    check("Cline global rule", cline.exists(), "run: agent-bridge install")
+    if cline.is_symlink():
+        check("Cline rule up-to-date (symlink)", cline.resolve() == RULES_FILE.resolve(),
+          "re-run: agent-bridge install")
+
+    # rule freshness: installed copies should match repo source
+    src = read_rule_text()
+    mdc_path = CURSOR_RULES_DIR / "agent-bridge.mdc"
+    if mdc_path.exists():
+        fresh = src.strip() in mdc_path.read_text()
+        check("Cursor rule content fresh", fresh, "re-run: agent-bridge install")
+    if BLOCK_START in md:
+        check("CLAUDE.md block content fresh", src.strip() in md,
+              "re-run: agent-bridge install")
+
+    root, initialized = find_project_root(Path.cwd())
+    check("current project initialized", initialized,
+          "cd into project && agent-bridge init")
+
+    print("\n" + ("All good." if ok else "Some checks failed — see hints."))
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="agent-bridge",
+        description="Cross-CLI context bridge for Claude Code, Cursor, and Cline.")
+    p.add_argument("--version", action="version", version=f"agent-bridge {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    h = sub.add_parser("hook", help=argparse.SUPPRESS)  # called by tool hooks
+    h.add_argument("tool", choices=["claude", "cursor"])
+    h.add_argument("event")
+
+    i = sub.add_parser("install", help="wire global rules + hooks into all 3 tools")
+    i.set_defaults(func=cmd_install)
+    u = sub.add_parser("uninstall", help="remove all wiring (keeps data)")
+    u.set_defaults(func=cmd_uninstall)
+    n = sub.add_parser("init", help="scaffold .agent-context/ + AGENTS.md in a project")
+    n.add_argument("path", nargs="?", default=None)
+    n.set_defaults(func=cmd_init)
+    s = sub.add_parser("status", help="show sessions for this project")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--all", action="store_true", help="include global activity log")
+    s.set_defaults(func=cmd_status)
+    r = sub.add_parser("register", help="create a session (for tools without hooks)")
+    r.add_argument("tool", choices=["claude", "cursor", "cline", "manual"])
+    r.add_argument("goal", nargs="*")
+    r.add_argument("--json", action="store_true")
+    r.set_defaults(func=cmd_register)
+    no = sub.add_parser("note", help="append a journal line to a session")
+    no.add_argument("text", nargs="*")
+    no.add_argument("--session", default=None)
+    no.set_defaults(func=cmd_note)
+    a = sub.add_parser("archive", help="archive a session into .agent-context/log/")
+    a.add_argument("session", nargs="?", default=None)
+    a.add_argument("--all-ended", action="store_true")
+    a.set_defaults(func=cmd_archive)
+    d = sub.add_parser("doctor", help="verify wiring across all tools")
+    d.set_defaults(func=cmd_doctor)
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.cmd == "hook":
+        try:
+            return run_hook(args.tool, args.event)
+        except Exception:
+            return 0  # hooks must never break the host CLI
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
