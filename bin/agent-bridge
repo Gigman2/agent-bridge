@@ -1012,10 +1012,166 @@ def cmd_resume(args) -> int:
     return 0
 
 
+def cmd_handoff(args) -> int:
+    """Synthesize a handoff for a session from its own recorded material.
+
+    Honest framing: this extracts what the hooks captured — it does not
+    understand the work. The result is a starting point the resuming agent
+    must verify and refine, not a substitute for one.
+    """
+    root, initialized = find_project_root(Path.cwd())
+    if not initialized:
+        print(f"No {CTX_DIRNAME}/ found above {Path.cwd()}.", file=sys.stderr)
+        return 1
+    idx = load_index(root)
+    key = args.session
+    if not key:
+        actives = sorted(
+            ((e.get("last_active", ""), k) for k, e in idx["sessions"].items()
+             if e.get("status") == "active"),
+            reverse=True)
+        if not actives:
+            print("No active session to write a handoff for.")
+            return 1
+        key = actives[0][1]
+    if key not in idx["sessions"]:
+        print(f"Unknown session '{key}'.", file=sys.stderr)
+        return 1
+    entry = idx["sessions"][key]
+    sdir = find_session_dir(root, key)
+    if not sdir:
+        print(f"Session dir missing for {key}.", file=sys.stderr)
+        return 1
+
+    journal = (sdir / "journal.md").read_text() if (sdir / "journal.md").exists() else ""
+    last_said = (sdir / "last_said.md").read_text() if (sdir / "last_said.md").exists() else ""
+    # Files in play: most recent unique EDIT targets
+    files = []
+    for line in journal.splitlines():
+        if line.startswith("- [") and "EDIT:" in line:
+            f = line.split("EDIT:", 1)[1].strip()
+            if f and f not in files:
+                files.append(f)
+    files = files[-12:]
+
+    # Commands that failed — useful gotchas
+    fails = []
+    for line in journal.splitlines():
+        if line.startswith("- [") and "CMD:" in line and "(exit 1)" in line:
+            c = line.split("CMD:", 1)[1].strip()
+            if c and c not in fails:
+                fails.append(c)
+
+    parts = [
+        "---",
+        "status: active          # active | blocked | done",
+        f"tool: {entry.get('tool', '?')}",
+        f"session: {key}",
+        f"updated: {now_iso()}",
+        f"generated: agent-bridge handoff (mechanical extraction, not understanding)",
+        "---",
+        "",
+        f"# Handoff — {key}",
+        "",
+        "## Goal",
+        "",
+        f"> Recorded first prompt: {entry.get('goal', '(none)')}",
+        "> NOTE: this is a mechanical extraction. The goal above is the literal first",
+        "> prompt, which may be a resumption phrase like 'resume' rather than a real",
+        "> goal. The resuming agent should confirm the actual objective from the plan",
+        "> files and the Current State below before proceeding.",
+        "",
+        "## Current State",
+        "",
+    ]
+    if last_said.strip():
+        parts += [
+            "Most recent agent statement (verbatim from the session):",
+            "",
+            "```",
+            last_said.strip(),
+            "```",
+            "",
+            "Treat this as the agent's own summary of where things stood. It is the",
+            "highest-signal material available; verify against the plan files before",
+            "acting on it.",
+            "",
+        ]
+    else:
+        parts += [
+            "No agent statement was captured for this session (the Stop hook did not",
+            "fire, or the transcript was unavailable). See the journal tail below.",
+            "",
+        ]
+
+    parts += [
+        "## Key Decisions",
+        "",
+        "NOT EXTRACTED. The journal records commands and file edits, not rationale.",
+        "Read the relevant plan/spec files (listed by `agent-bridge resume`) and the",
+        "git log to recover decisions; do not assume intent from what was edited.",
+        "",
+        "## Next Actions",
+        "",
+    ]
+    if last_said.strip():
+        fwd = []
+        for line in last_said.splitlines():
+            s = line.strip().strip("*").strip(" *").strip()
+            if any(w in s.lower() for w in ("next", "running", "still", "after these",
+                                             "left", "todo", "will", "going", "now")):
+                if s and s not in fwd:
+                    fwd.append(s)
+        if fwd:
+            parts.append("> From the agent's last statement:")
+            for f in fwd[:4]:
+                parts.append(f"> - {f}")
+            parts.append("")
+        parts.append("The resuming agent should re-derive concrete, verifiable next "
+                     "actions from the plan files rather than trusting the above.")
+    else:
+        parts.append("No next actions could be derived. Read the journal tail and the",
+                     "project's plan files.")
+    parts.append("")
+
+    parts += ["## Files in Play", ""]
+    if files:
+        for f in files:
+            parts.append(f"- `{f}`")
+    else:
+        parts.append("- (no file edits recorded)")
+    parts.append("")
+
+    parts += ["## Gotchas", ""]
+    if fails:
+        parts.append("Commands that failed during this session:")
+        for f in fails[:6]:
+            parts.append(f"- `{f}`")
+        parts.append("")
+    parts.append("This handoff was generated mechanically from hook-captured data.")
+    parts.append("It may be stale or incomplete - check the session's journal.md")
+    parts.append("directly if something looks wrong.")
+
+    out = "\n".join(parts) + "\n"
+    (sdir / "handoff.md").write_text(out)
+    touch_index(root, key, last_line=f"handoff regenerated ({now_iso()[:19]})")
+    if args.json:
+        print(json.dumps({"session": key, "handoff": str(sdir / "handoff.md"),
+                          "files": files, "fails": fails}, indent=2))
+    else:
+        print(f"Handoff written for {key} -> {CTX_DIRNAME}/sessions/{key}/handoff.md")
+        print(f"  files in play: {len(files)}")
+        print(f"  failed commands: {len(fails)}")
+        print(f"  agent statement captured: {bool(last_said.strip())}")
+        print("\nThis is a mechanical extraction — verify against the plan files")
+        print("and the session's journal.md before acting on it.")
+    return 0
+
+
 def cmd_archive(args) -> int:
     root, initialized = find_project_root(Path.cwd())
     if not initialized:
-        print(f"No {CTX_DIRNAME}/ found.", file=sys.stderr)
+        print(f"No {CTX_DIRNAME}/ found above {Path.cwd()}.", file=sys.stderr)
         return 1
     idx = load_index(root)
     targets = []
@@ -1148,6 +1304,11 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("session", nargs="?", default=None)
     r.add_argument("--json", action="store_true")
     r.set_defaults(func=cmd_resume)
+    h = sub.add_parser("handoff", help="synthesize a handoff for a session from its recorded material")
+    h.add_argument("session", nargs="?", default=None)
+    h.add_argument("--json", action="store_true")
+    h.set_defaults(func=cmd_handoff)
+
     return p
 
 
