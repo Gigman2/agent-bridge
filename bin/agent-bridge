@@ -887,6 +887,131 @@ def cmd_note(args) -> int:
     print(f"noted -> {key}")
     return 0
 
+def score_handoff(root: Path, sdir: Path) -> dict:
+    """Score how resumable a session's handoff is.
+
+    Returns {score, reasons, sources} where sources lists the fallback
+    context locations the project actually has, so a weak handoff still
+    has somewhere to look.
+    """
+    handoff = sdir / "handoff.md"
+    text = handoff.read_text() if handoff.exists() else ""
+    score = 0
+    reasons = []
+
+    # Not a template — placeholder markers are a hard fail, not a soft reason
+    template_markers = ("<one paragraph", "<where things stand",
+                        "<ordered, specific", "<path> — <what changed",
+                        "<decision + rationale", "<errors hit")
+    sources_only = any(m in text for m in template_markers)
+    if sources_only:
+        reasons.append("handoff is still the blank template")
+
+    # Section completeness (skipped when handoff is still the blank template)
+    sections = ["## Goal", "## Current State", "## Next Actions", "## Files in Play"]
+    if not sources_only:
+        present = [s for s in sections if s in text]
+        score += 2 * len(present)
+        if len(present) < len(sections):
+            reasons.append(f"handoff missing {len(sections) - len(present)} section(s): "
+                           + ", ".join(s for s in sections if s not in present))
+
+    # Non-trivial length
+    body = text.split("---", 2)[-1] if text.startswith("---") else text
+    if not sources_only and len(body.strip()) > 400:
+        score += 2
+
+    # Next actions populated
+    if not sources_only and "Next Actions" in text:
+        na = text.split("Next Actions", 1)[1].split("##", 1)[0]
+        real = [l for l in na.splitlines() if l.strip() and not l.strip().startswith("<")]
+        if real:
+            score += 3
+        else:
+            reasons.append("Next Actions is empty")
+
+    # Journal + last_said exist as fallbacks
+    if (sdir / "journal.md").exists():
+        score += 1
+    if (sdir / "last_said.md").exists():
+        score += 2
+
+    # Project-level fallback sources (independent of the session)
+    sources = []
+    for name, pat in (
+        ("AGENTS.md", "AGENTS.md"),
+        ("CLAUDE.md", "CLAUDE.md"),
+        ("superpowers ledger", ".superpowers/sdd/progress.md"),
+        ("BRIEFS ledger", "BRIEFS/*/sdd/progress.md"),
+        ("sdd plan", "BRIEFS/*/plans/*.md"),
+        ("sdd design", "BRIEFS/*/specs/*.md"),
+        ("git log", None),  # checked separately
+    ):
+        if pat is None:
+            try:
+                out = subprocess.run(
+                    ["git", "-C", str(root), "log", "--oneline", "-8"],
+                    capture_output=True, text=True, timeout=2)
+                if out.returncode == 0 and out.stdout.strip():
+                    sources.append(name)
+            except Exception:
+                pass
+        else:
+            hits = []
+            for hit in root.glob(pat):
+                if hit.is_file():
+                    hits.append(hit)
+            if hits:
+                sources.append(f"{name} ({len(hits)})")
+
+    return {"score": score, "reasons": reasons, "sources": sources,
+            "sufficient": score >= 8}
+
+
+def cmd_resume(args) -> int:
+    """Report whether a session's handoff is sufficient, and what else exists."""
+    root, initialized = find_project_root(Path.cwd())
+    if not initialized:
+        print(f"No {CTX_DIRNAME}/ found above {Path.cwd()}.", file=sys.stderr)
+        return 1
+    idx = load_index(root)
+    key = args.session
+    if not key:
+        actives = sorted(
+            ((e.get("last_active", ""), k) for k, e in idx["sessions"].items()
+             if e.get("status") == "active"),
+            reverse=True)
+        if not actives:
+            print("No active session to resume.")
+            return 1
+        key = actives[0][1]
+    if key not in idx["sessions"]:
+        print(f"Unknown session '{key}'.", file=sys.stderr)
+        return 1
+    sdir = find_session_dir(root, key)
+    if not sdir:
+        print(f"Session dir missing for {key}.", file=sys.stderr)
+        return 1
+    sc = score_handoff(root, sdir)
+    if args.json:
+        print(json.dumps({"session": key, **sc}, indent=2))
+        return 0
+    print(f"SESSION  {key}\n")
+    print(f"Handoff score: {sc['score']}/16 — "
+          f"{'SUFFICIENT' if sc['sufficient'] else 'INSUFFICIENT'}")
+    if sc["reasons"]:
+        print("\nProblems:")
+        for r in sc["reasons"]:
+            print(f"  - {r}")
+    print("\nFallback sources available in this project:")
+    for s in sc["sources"]:
+        print(f"  - {s}")
+    if not sc["sufficient"]:
+        print("\nA weak handoff still has material to build from — read the fallback "
+              "sources above and the session's journal.md, then write handoff.md.")
+    return 0
+
+
 def cmd_archive(args) -> int:
     root, initialized = find_project_root(Path.cwd())
     if not initialized:
@@ -1019,6 +1144,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.set_defaults(func=cmd_archive)
     d = sub.add_parser("doctor", help="verify wiring across all tools")
     d.set_defaults(func=cmd_doctor)
+    r = sub.add_parser("resume", help="score a session's handoff; list fallback sources")
+    r.add_argument("session", nargs="?", default=None)
+    r.add_argument("--json", action="store_true")
+    r.set_defaults(func=cmd_resume)
     return p
 
 
