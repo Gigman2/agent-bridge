@@ -9,3 +9,6 @@ __pycache__/
 
 # Local debug dumps
 .agent-bridge-debug/
+
+# Mid-session activation marker (transient; consumed by the first hook event)
+.activated

@@ -240,6 +240,92 @@ def find_session_dir(root: Path, key: str):
     sdir = ctx_dir(root) / "sessions" / key
     return sdir if sdir.is_dir() else None
 
+
+# ---------------------------------------------------------------------------
+# mid-session activation (init run while an agent is already working)
+# ---------------------------------------------------------------------------
+
+ACTIVATED_MARKER = ".activated"
+
+
+def write_activated_marker(root: Path) -> None:
+    """init writes this; the hook consumes it to nudge a running agent."""
+    try:
+        (ctx_dir(root) / ACTIVATED_MARKER).write_text(
+            json.dumps({"ts": now_iso(), "by": "init"}))
+    except Exception:
+        pass
+
+
+def consume_activated_marker(root: Path, sdir: Path, key: str) -> str:
+    """If a marker exists newer than this session, nudge the agent to build a handoff.
+
+    Returns the injected context text, or "" if no marker / already consumed.
+    """
+    marker = ctx_dir(root) / ACTIVATED_MARKER
+    if not marker.exists():
+        return ""
+    try:
+        meta = load_json(sdir / "meta.json", {})
+        started = meta.get("started", "")
+        mtime = datetime.fromtimestamp(marker.stat().st_mtime).isoformat(timespec="seconds")
+        if started and mtime <= started:
+            return ""  # marker predates this session; not a mid-session activation
+    except Exception:
+        pass
+    try:
+        marker.unlink()
+    except Exception:
+        pass
+    journal_append(sdir, "CONTINUITY ACTIVATED mid-session (agent-bridge init ran "
+                         "after this session started); agent prompted to build handoff.")
+    touch_index(root, key, last_line="continuity activated — build handoff")
+    return (
+        "[agent-bridge] Session continuity was ACTIVATED mid-session — `agent-bridge init` "
+        "was run while you were already working. Your session dir "
+        f"({CTX_DIRNAME}/sessions/{key}/) and handoff.md were just created.\n"
+        "Build your handoff NOW from the conversation so far: write {CTX_DIRNAME}/sessions/"
+        f"{key}/handoff.md with Goal / Current State / Key Decisions / Next Actions / "
+        "Files in Play / Gotchas. Make Next Actions ordered and verifiable. "
+        "This is what lets another tool resume if you hit a usage limit. "
+        "Do not wait to be asked twice.")
+
+
+def detect_running_sessions(root: Path):
+    """Best-effort: register running agent CLIs whose cwd is under `root`.
+
+    Non-fatal; purely a convenience so a mid-session init has a named session
+    to attach future hook events to. The hook itself creates the session on its
+    next event regardless.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-ax", "-o", "pid=,command=,cwd="],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+    except Exception:
+        return []
+    root_s = str(root)
+    found = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, cmd, cwd = parts
+        if not cwd.startswith(root_s):
+            continue
+        low = cmd.lower()
+        tool = None
+        if "claude" in low and "node" in low:
+            tool = "claude"
+        elif "cline" in low:
+            tool = "cline"
+        elif "cursor-agent" in low or ("cursor" in low and "agent" in low):
+            tool = "cursor"
+        if tool:
+            found.append((tool, pid))
+    return found
+
 # ---------------------------------------------------------------------------
 # hook handlers
 # ---------------------------------------------------------------------------
@@ -368,11 +454,18 @@ def run_hook(tool: str, event: str) -> int:
     sid = resolve_session_id(tool, payload)
     key, sdir = ensure_session(root, tool, sid)
 
+    # Mid-session activation: init ran after this session started. Nudge the agent
+    # to build its handoff from the conversation so far, then consume the marker.
+    nudge = consume_activated_marker(root, sdir, key)
+
     if event == "session-start":
         source = payload.get("source") or payload.get("reason") or ""
         journal_append(sdir, f"SESSION START ({source})".rstrip())
         global_activity(f"{root} {key} session-start")
-        emit_context(tool, "SessionStart", build_start_context(root, tool, key))
+        ctx = build_start_context(root, tool, key)
+        if nudge:
+            ctx = nudge + "\n\n" + ctx
+        emit_context(tool, "SessionStart", ctx)
         return 0
 
     if event == "prompt":
@@ -384,6 +477,8 @@ def run_hook(tool: str, event: str) -> int:
         if text and not entry.get("goal"):
             fields["goal"] = one_line(text, 140)
         touch_index(root, key, **fields)
+        if nudge:
+            emit_context(tool, "UserPromptSubmit", nudge)
         return 0
 
     if event == "tool":  # PostToolUse / postToolUse
@@ -406,12 +501,16 @@ def run_hook(tool: str, event: str) -> int:
             brief = tin.get("file_path") or tin.get("command") or ""
             journal_append(sdir, f"TOOL: {name} {brief}".rstrip())
             touch_index(root, key, last_line=f"TOOL: {name}")
+        if nudge:
+            emit_context(tool, "PostToolUse", nudge)
         return 0
 
     if event == "edit":  # Cursor afterFileEdit
         path = payload.get("file_path") or payload.get("filePath") or "?"
         journal_append(sdir, f"EDIT: {path}")
         touch_index(root, key, last_line=f"EDIT: {one_line(path, 100)}")
+        if nudge:
+            emit_context(tool, "postToolUse", nudge)
         return 0
 
     if event == "shell":  # Cursor afterShellExecution
@@ -420,12 +519,16 @@ def run_hook(tool: str, event: str) -> int:
         suffix = f" ({int(dur)}ms)" if isinstance(dur, (int, float)) else ""
         journal_append(sdir, f"CMD: {cmd}{suffix}")
         touch_index(root, key, last_line=f"CMD: {one_line(cmd, 100)}")
+        if nudge:
+            emit_context(tool, "afterShellExecution", nudge)
         return 0
 
     if event == "response":  # Cursor afterAgentResponse
         text = payload_text(payload)
         if text:
             record_last_said(root, key, sdir, text)
+        if nudge:
+            emit_context(tool, "afterAgentResponse", nudge)
         return 0
 
     if event == "stop":
@@ -441,6 +544,8 @@ def run_hook(tool: str, event: str) -> int:
         trigger = payload.get("trigger") or ""
         journal_append(sdir, f"COMPACT: context window compacted {trigger}".rstrip())
         touch_index(root, key, last_line="context compacted")
+        if nudge:
+            emit_context(tool, "PreCompact", nudge)
         return 0
 
     if event == "session-end":
@@ -688,6 +793,11 @@ def cmd_init(args) -> int:
     print(f"  ✓ CLAUDE.md: {claude_status}")
     print("\nEvery Claude Code / Cursor session here now auto-journals. "
           "Cline joins via its global rule.")
+    write_activated_marker(target)
+    running = detect_running_sessions(target)
+    if running:
+        print(f"\n  • {len(running)} running agent(s) detected in this project; "
+              "continuity will be activated on their next action.")
     return 0
 
 def cmd_status(args) -> int:
