@@ -477,7 +477,14 @@ def run_hook(tool: str, event: str) -> int:
         if text and not entry.get("goal"):
             fields["goal"] = one_line(text, 140)
         touch_index(root, key, **fields)
-        if nudge:
+        # Resume-like prompt: surface the handoff score and fallback sources so
+        # the agent can read and summarize itself. Surfacing only - we do not
+        # write a handoff for it, because a mechanical extraction cannot
+        # understand the work the way the agent can.
+        if is_resume_prompt(text):
+            emit_context(tool, "UserPromptSubmit",
+                        build_resume_context(root, key, sdir))
+        elif nudge:
             emit_context(tool, "UserPromptSubmit", nudge)
         return 0
 
@@ -886,6 +893,60 @@ def cmd_note(args) -> int:
     touch_index(root, key, last_line=f"NOTE: {one_line(text, 120)}")
     print(f"noted -> {key}")
     return 0
+def is_resume_prompt(text: str) -> bool:
+    """True when the user is asking the agent to continue a paused session."""
+    if not text:
+        return False
+    low = text.strip().lower()
+    return bool(re.match(
+        r'^(resume|continue|pick up|carry on|go on|keep going|'
+        r'resume (this|the|from)|continue (from|with)|pick up (from|where we left))',
+        low))
+
+
+def build_resume_context(root: Path, key: str, sdir: Path) -> str:
+    """Format the handoff score + fallback sources as injected agent context.
+
+    Surfacing only - the agent reads and summarizes itself. We do not write
+    a handoff for it, because a mechanical extraction cannot understand the
+    work the way the agent can.
+    """
+    sc = score_handoff(root, sdir)
+    entry = load_index(root)["sessions"].get(key, {})
+    lines = [
+        "[agent-bridge] The user asked you to RESUME a paused session.",
+        f"Your session: {CTX_DIRNAME}/sessions/{key}/",
+        f"Handoff score: {sc['score']}/16 - "
+        f"{'SUFFICIENT' if sc['sufficient'] else 'INSUFFICIENT'} to resume from alone.",
+    ]
+    if sc["reasons"]:
+        lines.append("Problems with the handoff:")
+        for r in sc["reasons"]:
+            lines.append(f"  - {r}")
+    lines.append("")
+    lines.append("Material available to read (in priority order):")
+    lines.append(f"  1. {CTX_DIRNAME}/sessions/{key}/handoff.md  <- the structured handoff")
+    lines.append(f"  2. {CTX_DIRNAME}/sessions/{key}/last_said.md  <- the agent's last statement")
+    lines.append(f"  3. {CTX_DIRNAME}/sessions/{key}/journal.md  <- every prompt, edit, command")
+    if sc["sources"]:
+        lines.append("  4. Project fallback sources:")
+        for s in sc["sources"]:
+            lines.append(f"     - {s}")
+    lines.append("")
+    lines.append("What to do:")
+    lines.append("  - Read the handoff first. If it is sufficient, summarize it in 2-3")
+    lines.append("    sentences and continue from Next Actions.")
+    lines.append("  - If it is insufficient (blank template, missing sections), read")
+    lines.append("    last_said.md and the fallback sources, then summarize what you")
+    lines.append("    understand and ask the user to confirm before proceeding.")
+    lines.append("  - Do NOT trust a mechanically generated handoff's Goal or Key")
+    lines.append("    Decisions - re-derive them from the plan files.")
+    if entry.get("goal") and entry["goal"].strip().lower() != "resume":
+        lines.append(f"  - Recorded first prompt: {entry['goal']}")
+    return "\n".join(lines)
+
+
+
 
 def score_handoff(root: Path, sdir: Path) -> dict:
     """Score how resumable a session's handoff is.
